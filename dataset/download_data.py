@@ -2,6 +2,9 @@ import os
 import requests
 from tqdm.auto import tqdm
 
+# from https://github.com/facebookresearch/KILT/
+# and https://github.com/facebookresearch/BLINK
+
 urls = [
     "http://dl.fbaipublicfiles.com/KILT/nq-train-kilt.jsonl",
     "http://dl.fbaipublicfiles.com/KILT/nq-dev-kilt.jsonl",
