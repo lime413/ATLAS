@@ -6,7 +6,6 @@ models/*
 uv.lock
 llama/*
 data/*
-eval/*.ipynb
 eval/llama_server.log
 tests/
 documentation/
