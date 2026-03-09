@@ -1,3 +1,12 @@
 data
 .venv
 __pycache__
+models/*
+.cursorignore
+uv.lock
+llama/*
+data/*
+eval/*.ipynb
+eval/llama_server.log
+tests/
+Project Proposal.pdf

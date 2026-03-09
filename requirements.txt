@@ -1,4 +1,9 @@
-# python 3.12.10
+# python 3.11
 # torch
+# llama.cpp
+# huggingface_hub
+# hf_xet
+# openai
+# accelerate
 bert_score
 lxml
