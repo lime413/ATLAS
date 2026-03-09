@@ -80,6 +80,7 @@ def rag_answer(query: str, index, top_k=5, max_tokens=256):
         f"Answer:"
     )
 
+    print('full prompt:', prompt)
     client = OpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
     resp = client.chat.completions.create(
         model="local-model",

@@ -32,7 +32,7 @@ CHUNK_OVERLAP = 100
 EMBED_BATCH = 64
 
 
-# ── wikitext cleanup ──────────────────────────────────────────────
+# ── wikitext cleanup part (we remove HTML artifacts) ───────────────────────────
 
 def clean_wikitext(raw: str) -> str:
     if not raw:
@@ -52,7 +52,7 @@ def clean_wikitext(raw: str) -> str:
     return t.strip()
 
 
-# ── chunking ──────────────────────────────────────────────────────
+# ── simple chunking ──────────────────────────────────────────────
 
 def chunk_text(text: str, title: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     if not text:
@@ -196,10 +196,8 @@ def build_index(
     with open(index_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
 
-    print("done ✓")
+    print("done")
 
-
-# ── CLI ───────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(description="Build Qdrant + BM25 index over Wikipedia passages")

@@ -9,5 +9,4 @@ data/*
 eval/*.ipynb
 eval/llama_server.log
 tests/
-Project Proposal.pdf
-*port.md
+documentation/
