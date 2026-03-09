@@ -181,7 +181,7 @@ def build_index(
     bm25_path = index_dir / "bm25.pkl"
     with open(bm25_path, "wb") as f:
         pickle.dump({"bm25": bm25, "meta": meta}, f)
-    print(f"bm25 saved → {bm25_path}")
+    print(f"bm25 saved to {bm25_path}")
 
     # 5) save config for the RAG part
     config = {
