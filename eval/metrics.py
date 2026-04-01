@@ -2,7 +2,11 @@ import re
 import string
 from collections import Counter
 from typing import List, Dict, Any
-from bert_score import score as bertscore
+
+try:
+    from bert_score import score as bertscore
+except ImportError:
+    bertscore = None
 
 
 _ARTICLES_RE = re.compile(r"\b(a|an|the)\b", flags=re.IGNORECASE)
@@ -75,6 +79,9 @@ def bertscore_pairwise(
     if not gold_answers:
         return []
 
+    if bertscore is None:
+        raise ImportError("bert_score is not installed, but use_bertscore=True was requested.")
+
     predictions = [prediction] * len(gold_answers)
     _, _, f1 = bertscore(
         cands=predictions,
@@ -97,6 +104,7 @@ def compare_with_gold(
     batch_size: int = 16,
     device: str = None,
     rescale_with_baseline: bool = True,
+    use_bertscore: bool = True,
 ) -> Dict[str, Any]:
     """
     For each gold answer:
@@ -119,15 +127,18 @@ def compare_with_gold(
             "best_bertscore": 0.0
         }
 
-    bertscores = bertscore_pairwise(
-        prediction=llm_answer,
-        gold_answers=gold_answers,
-        model_type=model_type,
-        lang=lang,
-        batch_size=batch_size,
-        device=device,
-        rescale_with_baseline=rescale_with_baseline,
-    )
+    if use_bertscore:
+        bertscores = bertscore_pairwise(
+            prediction=llm_answer,
+            gold_answers=gold_answers,
+            model_type=model_type,
+            lang=lang,
+            batch_size=batch_size,
+            device=device,
+            rescale_with_baseline=rescale_with_baseline,
+        )
+    else:
+        bertscores = [0.0] * len(gold_answers)
 
     all_pairs = []
     for gold, bs in zip(gold_answers, bertscores):
