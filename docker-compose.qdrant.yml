@@ -1,0 +1,29 @@
+# Qdrant for ATLAS RAG (named volume — avoid bind-mounting NTFS into Linux on Windows).
+#
+# Memory: limits keep the DB process bounded; target full machine budget ≤ ~40 GB together with
+# Python (embedder + optional BERTScore). Adjust "memory" if you need more headroom for scoring.
+#
+# Usage:
+#   docker compose -f docker-compose.qdrant.yml up -d
+#   uv run python rag/migrate_qdrant_to_server.py --index-dir data/index_50k_rawish --qdrant-url http://127.0.0.1:6333 --recreate
+#   set ATLAS_QDRANT_URL=http://127.0.0.1:6333
+#   uv run python eval/run_rag_hard_eval.py --index-dir data/index_50k_rawish ...
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.5
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - atlas_qdrant_storage:/qdrant/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 14G
+        reservations:
+          memory: 2G
+
+volumes:
+  atlas_qdrant_storage:

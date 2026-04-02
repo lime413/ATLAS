@@ -1,12 +1,20 @@
 """
-Stream Wikipedia passages into a hybrid index:
-- dense vectors in local Qdrant
-- sparse text search in SQLite FTS5
+Stream Wikipedia passages into a hybrid index.
 
-This version avoids loading all pages/chunks/BM25 structures into memory.
+**Режимы Qdrant**
+
+- **Docker** (по умолчанию): ``docker compose -f docker-compose.qdrant.yml up -d``, векторы по сети.
+  Ниже пик RAM в Python, чуть больше оверхед на upsert.
+- **Встроенный** (``--embedded-qdrant`` или ``ATLAS_QDRANT_EMBEDDED=1``): ``index_dir/qdrant_store/`` —
+  обычно **быстрее** полная индексация (как «за ночь»), но **выше RAM** в процессе. Для укладки в ~40 ГБ
+  можно сочетать с ``--page-limit`` (меньший корпус).
+
+**Общее:** ``index_dir / passages.sqlite`` — тексты + FTS5; коллекция ``wiki_passages`` — плотные векторы.
 """
 
 import argparse
+import os
+import gc
 import json
 import re
 import shutil
@@ -14,10 +22,26 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable
 
+import torch
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+
+try:
+    from rag.embedder_factory import make_sentence_transformer
+    from rag.qdrant_backend import (
+        DEFAULT_QDRANT_URL,
+        open_qdrant_client,
+        verify_qdrant_reachable,
+    )
+except ImportError:
+    from embedder_factory import make_sentence_transformer
+    from qdrant_backend import (
+        DEFAULT_QDRANT_URL,
+        open_qdrant_client,
+        verify_qdrant_reachable,
+    )
 
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "wikipedia_pages_50k.sqlite"
@@ -28,8 +52,10 @@ EMBED_MODEL = "jinaai/jina-embeddings-v3"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 PAGE_BATCH = 128
-EMBED_BATCH = 64
-FLUSH_CHUNKS = 2048
+# Выше = быстрее энкод на GPU; при OOM уменьшить флагом --embed-batch.
+EMBED_BATCH = 128
+# Реже upsert в Qdrant (быстрее); пик RAM энкода ограничен --embed-batch, не этим числом.
+FLUSH_CHUNKS = 4096
 CLEAN_MODE = "raw-ish"
 
 
@@ -154,14 +180,16 @@ def flush_chunks(
         return vector_dim, 0
 
     texts = [row["text"] for row in chunk_rows]
-    vectors = embedder.encode(
-        texts,
-        batch_size=embed_batch,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-        task="retrieval.passage",
-        convert_to_numpy=True,
-    )
+
+    with torch.inference_mode():
+        vectors = embedder.encode(
+            texts,
+            batch_size=embed_batch,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            task="retrieval.passage",
+            convert_to_numpy=True,
+        )
 
     if vector_dim is None:
         vector_dim = int(vectors.shape[1])
@@ -177,6 +205,8 @@ def flush_chunks(
         for idx, row in enumerate(chunk_rows)
     ]
     qdrant.upsert(collection_name=collection, points=points)
+    del vectors, points
+    gc.collect()
 
     passages_cur = passages_conn.cursor()
     passages_cur.executemany(
@@ -214,13 +244,14 @@ def build_index(
     flush_chunks_at: int,
     page_limit: int | None,
     embed_model: str,
+    qdrant_url: str | None = None,
 ) -> None:
     reset_index_dir(index_dir)
 
     passages_db_path = index_dir / "passages.sqlite"
     passages_conn = init_passages_db(passages_db_path)
-    qdrant = QdrantClient(path=str(index_dir / "qdrant_store"))
-    embedder = SentenceTransformer(embed_model, trust_remote_code=True)
+    qdrant: QdrantClient | None = None
+    embedder: SentenceTransformer | None = None
 
     total_pages = count_pages(db_path)
     if page_limit is not None and page_limit > 0:
@@ -233,6 +264,10 @@ def build_index(
     total_chunks = 0
 
     try:
+        qdrant = open_qdrant_client(url=qdrant_url, index_dir=index_dir)
+        verify_qdrant_reachable(qdrant)
+        embedder = make_sentence_transformer(embed_model)
+
         for page_rows in tqdm(iter_pages(db_path, page_limit, page_batch), total=(total_pages + page_batch - 1) // page_batch, desc="page batches"):
             for page in page_rows:
                 processed_pages += 1
@@ -296,11 +331,22 @@ def build_index(
         print({"pages_indexed": processed_pages, "chunks_indexed": total_chunks, "index_dir": str(index_dir)})
     finally:
         passages_conn.close()
-        qdrant.close()
+        if qdrant is not None:
+            qdrant.close()
+        if embedder is not None:
+            del embedder
+            gc.collect()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a streaming hybrid index over Wikipedia passages")
+    parser = argparse.ArgumentParser(
+        description="Build hybrid index: dense vectors in Qdrant (Docker or embedded), passages in SQLite.",
+        epilog=(
+            f"Docker: docker compose -f docker-compose.qdrant.yml up -d  →  {DEFAULT_QDRANT_URL}\n"
+            "Быстрее индекс без Docker:  --embedded-qdrant  (выше RAM; при нехватке памяти — --page-limit)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument("--index-dir", default=str(INDEX_DIR))
     parser.add_argument(
@@ -324,7 +370,20 @@ def main() -> None:
     parser.add_argument("--embed-batch", type=int, default=EMBED_BATCH)
     parser.add_argument("--flush-chunks", type=int, default=FLUSH_CHUNKS)
     parser.add_argument("--embed-model", default=EMBED_MODEL)
+    parser.add_argument(
+        "--qdrant-url",
+        default=DEFAULT_QDRANT_URL,
+        help=f"Qdrant URL (ignored if --embedded-qdrant). Default: {DEFAULT_QDRANT_URL}.",
+    )
+    parser.add_argument(
+        "--embedded-qdrant",
+        action="store_true",
+        help="Write vectors to index_dir/qdrant_store (in-process). Faster bulk indexing, higher RAM than Docker.",
+    )
     args = parser.parse_args()
+
+    if args.embedded_qdrant:
+        os.environ["ATLAS_QDRANT_EMBEDDED"] = "1"
 
     build_index(
         db_path=Path(args.db),
@@ -337,6 +396,7 @@ def main() -> None:
         flush_chunks_at=args.flush_chunks,
         page_limit=args.page_limit,
         embed_model=args.embed_model,
+        qdrant_url=args.qdrant_url.strip(),
     )
 
 

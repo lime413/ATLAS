@@ -10,3 +10,4 @@ eval/llama_server.log
 tests/
 documentation/
 rag/llama_server.log
+output/
