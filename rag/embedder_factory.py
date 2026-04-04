@@ -1,10 +1,18 @@
-"""SentenceTransformer construction tuned for lower host RAM (threads, dtype, low_cpu_mem_usage)."""
+"""SentenceTransformer construction: GPU by default, optional dtype/thread knobs."""
 
 from __future__ import annotations
 
 import os
 
 from sentence_transformers import SentenceTransformer
+
+
+def _default_device() -> str:
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def apply_torch_thread_env() -> None:
@@ -30,7 +38,7 @@ def make_sentence_transformer(model_id: str) -> SentenceTransformer:
     elif dtype_s in ("bfloat16", "bf16"):
         model_kwargs["torch_dtype"] = torch.bfloat16
 
-    device = (os.environ.get("ATLAS_EMBED_DEVICE") or "").strip() or None
+    device = (os.environ.get("ATLAS_EMBED_DEVICE") or "").strip() or _default_device()
 
     return SentenceTransformer(
         model_id,

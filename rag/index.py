@@ -24,7 +24,7 @@ from typing import Iterable
 
 import torch
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, HnswConfigDiff, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -197,7 +197,10 @@ def flush_chunks(
             qdrant.delete_collection(collection)
         qdrant.create_collection(
             collection_name=collection,
-            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
+            vectors_config=VectorParams(
+                size=vector_dim, distance=Distance.COSINE, on_disk=True,
+            ),
+            hnsw_config=HnswConfigDiff(on_disk=True),
         )
 
     points = [
