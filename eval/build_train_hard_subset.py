@@ -7,7 +7,7 @@ Build a smaller Wikipedia SQLite + train_hard JSONL subset:
 4. Copy matching rows from the source pages DB into a new SQLite file.
 
 Then index with:
-  uv run python rag/index.py --db data/wikipedia_pages_hard_10k.sqlite --index-dir data/index_hard_10k --embedded-qdrant
+  uv run python rag/index.py --db data/wikipedia_pages_hard_10k.sqlite --index-dir data/index_hard_10k
 And eval with:
   uv run python eval/run_rag_hard_eval.py --input data/train_hard_subset_10k.jsonl --index-dir data/index_hard_10k ...
 """

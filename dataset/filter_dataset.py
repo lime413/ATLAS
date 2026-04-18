@@ -8,10 +8,11 @@ sys.path.append(".")
 from openai import OpenAI
 
 from eval.metrics import compare_with_gold
+from rag.constants import DEFAULT_LLM_MODEL
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
-DEFAULT_MODEL = "local-model"
+DEFAULT_MODEL = DEFAULT_LLM_MODEL
 
 
 def llm_inference(

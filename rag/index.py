@@ -1,62 +1,37 @@
-"""
-Stream Wikipedia passages into a hybrid index.
-
-**Режимы Qdrant**
-
-- **Docker** (по умолчанию): ``docker compose -f docker-compose.qdrant.yml up -d``, векторы по сети.
-  Ниже пик RAM в Python, чуть больше оверхед на upsert.
-- **Встроенный** (``--embedded-qdrant`` или ``ATLAS_QDRANT_EMBEDDED=1``): ``index_dir/qdrant_store/`` —
-  обычно **быстрее** полная индексация (как «за ночь»), но **выше RAM** в процессе. Для укладки в ~40 ГБ
-  можно сочетать с ``--page-limit`` (меньший корпус).
-
-**Общее:** ``index_dir / passages.sqlite`` — тексты + FTS5; коллекция ``wiki_passages`` — плотные векторы.
-"""
+"""Stream Wikipedia passages into a hybrid index backed by FAISS + SQLite FTS5."""
 
 import argparse
-import os
 import gc
 import json
 import re
-import shutil
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+import faiss
+import numpy as np
 import torch
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, HnswConfigDiff, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 try:
     from rag.embedder_factory import make_sentence_transformer
-    from rag.qdrant_backend import (
-        DEFAULT_QDRANT_URL,
-        open_qdrant_client,
-        verify_qdrant_reachable,
-    )
 except ImportError:
     from embedder_factory import make_sentence_transformer
-    from qdrant_backend import (
-        DEFAULT_QDRANT_URL,
-        open_qdrant_client,
-        verify_qdrant_reachable,
-    )
 
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "wikipedia_pages_50k.sqlite"
 INDEX_DIR = DATA_DIR / "index_50k"
 
-COLLECTION = "wiki_passages"
 EMBED_MODEL = "jinaai/jina-embeddings-v3"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 PAGE_BATCH = 128
-# Выше = быстрее энкод на GPU; при OOM уменьшить флагом --embed-batch.
 EMBED_BATCH = 128
-# Реже upsert в Qdrant (быстрее); пик RAM энкода ограничен --embed-batch, не этим числом.
 FLUSH_CHUNKS = 4096
 CLEAN_MODE = "raw-ish"
+FAISS_INDEX_FILE = "faiss.index"
 
 
 def normalize_wiki_formatting(text: str) -> str:
@@ -100,10 +75,21 @@ def chunk_text(text: str, title: str, size: int, overlap: int) -> list[str]:
     return chunks
 
 
-def reset_index_dir(index_dir: Path) -> None:
-    if index_dir.exists():
-        shutil.rmtree(index_dir)
-    index_dir.mkdir(parents=True, exist_ok=True)
+def prepare_index_dir(index_dir: Path) -> Path:
+    if not index_dir.exists():
+        index_dir.mkdir(parents=True, exist_ok=False)
+        return index_dir
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = index_dir.parent / f"{index_dir.name}_{timestamp}"
+    suffix = 1
+    while candidate.exists():
+        candidate = index_dir.parent / f"{index_dir.name}_{timestamp}_{suffix:02d}"
+        suffix += 1
+
+    candidate.mkdir(parents=True, exist_ok=False)
+    print(f"index_dir exists, writing new index to {candidate}")
+    return candidate
 
 
 def init_passages_db(path: Path) -> sqlite3.Connection:
@@ -170,14 +156,13 @@ def iter_pages(db_path: Path, page_limit: int | None, page_batch: int) -> Iterab
 def flush_chunks(
     chunk_rows: list[dict],
     embedder: SentenceTransformer,
-    qdrant: QdrantClient,
+    faiss_index: faiss.Index | None,
     passages_conn: sqlite3.Connection,
-    collection: str,
     embed_batch: int,
     vector_dim: int | None,
-) -> tuple[int | None, int]:
+) -> tuple[faiss.Index | None, int | None, int]:
     if not chunk_rows:
-        return vector_dim, 0
+        return faiss_index, vector_dim, 0
 
     texts = [row["text"] for row in chunk_rows]
 
@@ -190,25 +175,15 @@ def flush_chunks(
             task="retrieval.passage",
             convert_to_numpy=True,
         )
+    vectors = np.ascontiguousarray(vectors, dtype="float32")
 
-    if vector_dim is None:
+    if faiss_index is None:
         vector_dim = int(vectors.shape[1])
-        if qdrant.collection_exists(collection):
-            qdrant.delete_collection(collection)
-        qdrant.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(
-                size=vector_dim, distance=Distance.COSINE, on_disk=True,
-            ),
-            hnsw_config=HnswConfigDiff(on_disk=True),
-        )
+        faiss_index = faiss.IndexIDMap2(faiss.IndexFlatIP(vector_dim))
 
-    points = [
-        PointStruct(id=row["chunk_id"], vector=vectors[idx].tolist())
-        for idx, row in enumerate(chunk_rows)
-    ]
-    qdrant.upsert(collection_name=collection, points=points)
-    del vectors, points
+    ids = np.asarray([row["chunk_id"] for row in chunk_rows], dtype="int64")
+    faiss_index.add_with_ids(vectors, ids)
+    del vectors, ids
     gc.collect()
 
     passages_cur = passages_conn.cursor()
@@ -233,7 +208,7 @@ def flush_chunks(
         [(row["chunk_id"], row["title"], row["text"]) for row in chunk_rows],
     )
     passages_conn.commit()
-    return vector_dim, len(chunk_rows)
+    return faiss_index, vector_dim, len(chunk_rows)
 
 
 def build_index(
@@ -247,13 +222,12 @@ def build_index(
     flush_chunks_at: int,
     page_limit: int | None,
     embed_model: str,
-    qdrant_url: str | None = None,
 ) -> None:
-    reset_index_dir(index_dir)
+    index_dir = prepare_index_dir(index_dir)
 
     passages_db_path = index_dir / "passages.sqlite"
     passages_conn = init_passages_db(passages_db_path)
-    qdrant: QdrantClient | None = None
+    faiss_index: faiss.Index | None = None
     embedder: SentenceTransformer | None = None
 
     total_pages = count_pages(db_path)
@@ -267,11 +241,13 @@ def build_index(
     total_chunks = 0
 
     try:
-        qdrant = open_qdrant_client(url=qdrant_url, index_dir=index_dir)
-        verify_qdrant_reachable(qdrant)
         embedder = make_sentence_transformer(embed_model)
 
-        for page_rows in tqdm(iter_pages(db_path, page_limit, page_batch), total=(total_pages + page_batch - 1) // page_batch, desc="page batches"):
+        for page_rows in tqdm(
+            iter_pages(db_path, page_limit, page_batch),
+            total=(total_pages + page_batch - 1) // page_batch,
+            desc="page batches",
+        ):
             for page in page_rows:
                 processed_pages += 1
                 cleaned = clean_wikitext(page["text"] or "", mode=clean_mode)
@@ -290,12 +266,11 @@ def build_index(
                     next_chunk_id += 1
 
                 if len(chunk_rows) >= flush_chunks_at:
-                    vector_dim, uploaded = flush_chunks(
+                    faiss_index, vector_dim, uploaded = flush_chunks(
                         chunk_rows=chunk_rows,
                         embedder=embedder,
-                        qdrant=qdrant,
+                        faiss_index=faiss_index,
                         passages_conn=passages_conn,
-                        collection=COLLECTION,
                         embed_batch=embed_batch,
                         vector_dim=vector_dim,
                     )
@@ -305,21 +280,24 @@ def build_index(
             if processed_pages % 1000 == 0:
                 print(f"processed_pages={processed_pages} | total_chunks={total_chunks}")
 
-        vector_dim, uploaded = flush_chunks(
+        faiss_index, vector_dim, uploaded = flush_chunks(
             chunk_rows=chunk_rows,
             embedder=embedder,
-            qdrant=qdrant,
+            faiss_index=faiss_index,
             passages_conn=passages_conn,
-            collection=COLLECTION,
             embed_batch=embed_batch,
             vector_dim=vector_dim,
         )
         total_chunks += uploaded
         chunk_rows.clear()
 
+        if faiss_index is None or vector_dim is None or total_chunks == 0:
+            raise RuntimeError("No passages were indexed; FAISS index was not created.")
+
+        faiss.write_index(faiss_index, str(index_dir / FAISS_INDEX_FILE))
+
         config = {
             "embed_model": embed_model,
-            "collection": COLLECTION,
             "clean_mode": clean_mode,
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
@@ -327,6 +305,8 @@ def build_index(
             "n_chunks": total_chunks,
             "n_pages": processed_pages,
             "passages_db": "passages.sqlite",
+            "dense_backend": "faiss",
+            "dense_index_file": FAISS_INDEX_FILE,
         }
         with (index_dir / "config.json").open("w", encoding="utf-8") as fout:
             json.dump(config, fout, indent=2)
@@ -334,20 +314,16 @@ def build_index(
         print({"pages_indexed": processed_pages, "chunks_indexed": total_chunks, "index_dir": str(index_dir)})
     finally:
         passages_conn.close()
-        if qdrant is not None:
-            qdrant.close()
+        if faiss_index is not None:
+            del faiss_index
         if embedder is not None:
             del embedder
-            gc.collect()
+        gc.collect()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build hybrid index: dense vectors in Qdrant (Docker or embedded), passages in SQLite.",
-        epilog=(
-            f"Docker: docker compose -f docker-compose.qdrant.yml up -d  →  {DEFAULT_QDRANT_URL}\n"
-            "Быстрее индекс без Docker:  --embedded-qdrant  (выше RAM; при нехватке памяти — --page-limit)."
-        ),
+        description="Build hybrid index: dense vectors in FAISS, passages in SQLite.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--db", default=str(DB_PATH))
@@ -373,20 +349,7 @@ def main() -> None:
     parser.add_argument("--embed-batch", type=int, default=EMBED_BATCH)
     parser.add_argument("--flush-chunks", type=int, default=FLUSH_CHUNKS)
     parser.add_argument("--embed-model", default=EMBED_MODEL)
-    parser.add_argument(
-        "--qdrant-url",
-        default=DEFAULT_QDRANT_URL,
-        help=f"Qdrant URL (ignored if --embedded-qdrant). Default: {DEFAULT_QDRANT_URL}.",
-    )
-    parser.add_argument(
-        "--embedded-qdrant",
-        action="store_true",
-        help="Write vectors to index_dir/qdrant_store (in-process). Faster bulk indexing, higher RAM than Docker.",
-    )
     args = parser.parse_args()
-
-    if args.embedded_qdrant:
-        os.environ["ATLAS_QDRANT_EMBEDDED"] = "1"
 
     build_index(
         db_path=Path(args.db),
@@ -399,7 +362,6 @@ def main() -> None:
         flush_chunks_at=args.flush_chunks,
         page_limit=args.page_limit,
         embed_model=args.embed_model,
-        qdrant_url=args.qdrant_url.strip(),
     )
 
 

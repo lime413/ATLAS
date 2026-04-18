@@ -16,14 +16,14 @@ from openai import OpenAI
 sys.path.append(".")
 
 from eval.metrics import exact_match_score, token_f1_score
-from rag.qdrant_backend import DEFAULT_QDRANT_URL
+from rag.constants import DEFAULT_LLM_MODEL
 from rag.search import close_index, load_index, retrieve
 
 DEFAULT_INPUT = Path("data/train_hard.jsonl")
 DEFAULT_INDEX_DIR = Path("data/index_50k_rawish")
 DEFAULT_OUTPUT_DIR = Path("output")
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
-DEFAULT_MODEL = "google/gemma-4-E4B-it"
+DEFAULT_MODEL = DEFAULT_LLM_MODEL
 DEFAULT_BERT_MODEL = "microsoft/deberta-xlarge-mnli"
 
 
@@ -98,11 +98,10 @@ def generate_answers(
     sparse_weight: float,
     max_tokens: int,
     log_every: int,
-    qdrant_url: str | None,
     query_embed_batch: int,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    index = load_index(index_dir, qdrant_url=qdrant_url)
+    index = load_index(index_dir)
     client = OpenAI(base_url=base_url, api_key="not-needed")
 
     beb = max(1, int(query_embed_batch))
@@ -346,19 +345,6 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument(
-        "--qdrant-url",
-        default=None,
-        help=(
-            f"Qdrant URL (default: {DEFAULT_QDRANT_URL} or ATLAS_QDRANT_URL). "
-            "With --embedded-qdrant, vectors are read from index_dir/qdrant_store instead."
-        ),
-    )
-    parser.add_argument(
-        "--embedded-qdrant",
-        action="store_true",
-        help="Use index_dir/qdrant_store (set ATLAS_QDRANT_EMBEDDED). Faster than Docker, higher RAM.",
-    )
-    parser.add_argument(
         "--query-embed-batch",
         type=int,
         default=32,
@@ -427,10 +413,6 @@ def main() -> None:
     model_info = fetch_server_model_info(args.base_url)
     model_info_path.write_text(json.dumps(model_info, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    qdrant_url = (args.qdrant_url or "").strip() or None
-
-    if args.embedded_qdrant:
-        os.environ["ATLAS_QDRANT_EMBEDDED"] = "1"
 
     if args.stage in {"all", "generate"}:
         generate_answers(
@@ -445,7 +427,6 @@ def main() -> None:
             sparse_weight=args.sparse_weight,
             max_tokens=args.max_tokens,
             log_every=args.log_every,
-            qdrant_url=qdrant_url,
             query_embed_batch=args.query_embed_batch,
         )
 
