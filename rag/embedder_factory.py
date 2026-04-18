@@ -1,10 +1,10 @@
-"""Jina v3 embedder construction: GPU by default, optional dtype/thread knobs."""
+"""SentenceTransformer construction: GPU by default, optional dtype/thread knobs."""
 
 from __future__ import annotations
 
 import os
 
-from transformers import AutoModel
+from sentence_transformers import SentenceTransformer
 
 
 def _default_device() -> str:
@@ -13,17 +13,6 @@ def _default_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
-
-
-class JinaV3Embedder:
-    """Thin wrapper around the model's trust_remote_code ``encode`` API."""
-
-    def __init__(self, model, *, device: str):
-        self.model = model
-        self.device = device
-
-    def encode(self, *args, **kwargs):
-        return self.model.encode(*args, **kwargs)
 
 
 def apply_torch_thread_env() -> None:
@@ -38,24 +27,26 @@ def apply_torch_thread_env() -> None:
         torch.set_num_interop_threads(max(1, int(inter)))
 
 
-def make_embedder(model_id: str) -> JinaV3Embedder:
+def make_embedder(model_id: str) -> SentenceTransformer:
     apply_torch_thread_env()
     import torch
 
     dtype_s = (os.environ.get("ATLAS_EMBED_TORCH_DTYPE") or "").strip().lower()
-    model_kwargs: dict = {"trust_remote_code": True, "low_cpu_mem_usage": True}
+    model_kwargs: dict = {"low_cpu_mem_usage": True}
     if dtype_s in ("float16", "fp16"):
         model_kwargs["torch_dtype"] = torch.float16
     elif dtype_s in ("bfloat16", "bf16"):
         model_kwargs["torch_dtype"] = torch.bfloat16
 
     device = (os.environ.get("ATLAS_EMBED_DEVICE") or "").strip() or _default_device()
-    model = AutoModel.from_pretrained(model_id, **model_kwargs).eval()
-    if device:
-        model = model.to(device)
-    return JinaV3Embedder(model, device=device)
+    return SentenceTransformer(
+        model_id,
+        trust_remote_code=True,
+        model_kwargs=model_kwargs,
+        device=device,
+    )
 
 
-def make_sentence_transformer(model_id: str) -> JinaV3Embedder:
+def make_sentence_transformer(model_id: str) -> SentenceTransformer:
     """Backward-compatible alias for older call sites."""
     return make_embedder(model_id)
