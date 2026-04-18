@@ -17,10 +17,10 @@ from openai import OpenAI
 
 try:
     from rag.constants import DEFAULT_LLM_MODEL
-    from rag.embedder_factory import make_sentence_transformer
+    from rag.embedder_factory import make_embedder
 except ImportError:
     from constants import DEFAULT_LLM_MODEL
-    from embedder_factory import make_sentence_transformer
+    from embedder_factory import make_embedder
 
 DATA_DIR = Path("data")
 INDEX_DIR = DATA_DIR / "index_50k"
@@ -39,7 +39,7 @@ def load_index(index_dir: Path = INDEX_DIR) -> dict[str, Any]:
     if not dense_index_file.exists():
         raise FileNotFoundError(f"Dense index file not found: {dense_index_file}")
 
-    embedder = make_sentence_transformer(config["embed_model"])
+    embedder = make_embedder(config["embed_model"])
     faiss_index = faiss.read_index(str(dense_index_file))
     passages_db = (index_dir / config["passages_db"]).resolve()
     passages_conn = sqlite3.connect(f"{passages_db.as_uri()}?mode=ro", uri=True)

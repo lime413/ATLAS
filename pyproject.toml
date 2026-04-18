@@ -3,7 +3,7 @@ name = "atlas"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.13.0",
     "bert-score>=0.3.13",
@@ -11,10 +11,9 @@ dependencies = [
     "lxml>=6.0.2",
     "torch>=2.10.0",
     "faiss-cpu>=1.8.0",
-    "sentence-transformers>=3.4.0",
     "rank-bm25>=0.2.2",
     "tqdm>=4.67.0",
     "einops>=0.8.2",
-    "transformers==4.47.1",
+    "transformers>=5.4.0",
     "openai>=2.26.0",
 ]

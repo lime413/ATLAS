@@ -14,13 +14,12 @@ from typing import Iterable
 import faiss
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 try:
-    from rag.embedder_factory import make_sentence_transformer
+    from rag.embedder_factory import JinaV3Embedder, make_embedder
 except ImportError:
-    from embedder_factory import make_sentence_transformer
+    from embedder_factory import JinaV3Embedder, make_embedder
 
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "wikipedia_pages_50k.sqlite"
@@ -157,7 +156,7 @@ def iter_pages(db_path: Path, page_limit: int | None, page_batch: int) -> Iterab
 
 def flush_chunks(
     chunk_rows: list[dict],
-    embedder: SentenceTransformer,
+    embedder: JinaV3Embedder,
     faiss_index: faiss.Index | None,
     passages_conn: sqlite3.Connection,
     embed_batch: int,
@@ -230,7 +229,7 @@ def build_index(
     passages_db_path = index_dir / "passages.sqlite"
     passages_conn = init_passages_db(passages_db_path)
     faiss_index: faiss.Index | None = None
-    embedder: SentenceTransformer | None = None
+    embedder: JinaV3Embedder | None = None
 
     total_pages = count_pages(db_path)
     if page_limit is not None and page_limit > 0:
@@ -243,7 +242,7 @@ def build_index(
     total_chunks = 0
 
     try:
-        embedder = make_sentence_transformer(embed_model)
+        embedder = make_embedder(embed_model)
 
         for page_rows in tqdm(
             iter_pages(db_path, page_limit, page_batch),
