@@ -1,5 +1,7 @@
 """Stream Wikipedia passages into a hybrid index backed by FAISS + SQLite FTS5."""
 
+from __future__ import annotations
+
 import argparse
 import gc
 import json

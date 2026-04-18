@@ -1,5 +1,7 @@
 """Hybrid retrieval + RAG answer generation over a FAISS + SQLite index."""
 
+from __future__ import annotations
+
 import argparse
 import gc
 import json
