@@ -26,3 +26,19 @@ tail -f output/gen_50k_p00.log
 
 damn bufferization!
 watch -n 10 'date; echo; for f in output/index_50k_rawish_50k_p*_answers.jsonl; do [ -e "$f" ] || continue; n=$(wc -l < "$f"); printf "%s: %d / 12500 (%.2f%%)\n" "$(basename "$f")" "$n" "$(awk -v n="$n" "BEGIN{print n/12500*100}")"; done; echo; total=$(cat output/index_50k_rawish_50k_p*_answers.jsonl 2>/dev/null | wc -l); printf "TOTAL: %d / 68019 (%.2f%%)\n" "$total" "$(awk -v n="$total" "BEGIN{print n/68019*100}")"; echo; echo "RUNTIME:"; ps -eo pid,etime,cmd | grep "eval/run_rag_hard_eval.py" | grep -v grep'
+
+progress for metrics
+watch -n 5 'awk -v total=68019 '\''/scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); done=b[1]} END{printf "%.2f%%\n", (done/total)*100}'\'' output/score_50k_all.log'
+
+llm only eval progress
+watch -n 5 'awk -v total=68019 '\''/generated=/{split($0,a,"generated="); split(a[2],b," "); done=b[1]} /scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); scored=b[1]} END{if (scored>0) printf "scoring %.2f%%\n", (scored/total)*100; else printf "generation %.2f%%\n", (done/total)*100}'\'' output/llm_only_train_hard.log'
+
+score progress
+watch -n 5 'awk -v total=68019 '\''/scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); done=b[1]} END{printf "%.2f%%\n", (done/total)*100}'\'' output/score_50k_all.log'
+watch -n 5 'awk -v total=68019 '\''/scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); done=b[1]} END{printf "%.2f%%\n", (done/total)*100}'\'' output/llm_only_train_hard_score.log'
+
+web with structured pages
+python dataset/inspect_structured_pages.py \
+  --raw-db data/wikipedia_pages_50k.sqlite \
+  --structured-jsonl data/structured_pages_sample_20.jsonl \
+  --port 8090
