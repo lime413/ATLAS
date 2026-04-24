@@ -1,9 +1,11 @@
-# python 3.11
-# torch
-# llama.cpp
-# huggingface_hub
-# hf_xet
-# openai
-# accelerate
-bert_score
-lxml
+accelerate>=1.13.0
+bert-score>=0.3.13
+jupyter>=1.1.1
+lxml>=6.0.2
+# torch>=2.10.0
+faiss-cpu>=1.8.0
+rank-bm25>=0.2.2
+tqdm>=4.67.0
+einops>=0.8.2
+transformers==4.47.1
+openai>=2.26.0

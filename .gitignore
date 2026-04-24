@@ -11,3 +11,4 @@ tests/
 documentation/
 rag/llama_server.log
 output/
+.cache

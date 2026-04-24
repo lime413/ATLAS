@@ -1,0 +1,28 @@
+for i in 00 01 02 03; do
+  CUDA_VISIBLE_DEVICES=2 \
+  ATLAS_EMBED_DEVICE=cuda \
+  ATLAS_TORCH_INTRAOP_THREADS=4 \
+  ATLAS_TORCH_INTEROP_THREADS=1 \
+  OMP_NUM_THREADS=12 \
+  PYTHONUNBUFFERED=1 \
+  nohup python -u eval/run_rag_hard_eval.py \
+    --stage generate \
+    --input data/shards/train_hard_50k_part_${i}.jsonl \
+    --index-dir data/index_50k_rawish \
+    --base-url http://127.0.0.1:8082/v1 \
+    --model gemma-3-4b-it-Q4_K_M.gguf \
+    --run-name index_50k_rawish_50k_p${i} \
+    --top-k 5 \
+    --dense-limit 20 \
+    --sparse-limit 20 \
+    --sparse-weight 0.3 \
+    --query-embed-batch 128 \
+    --max-tokens 96 \
+    --log-every 100 \
+    > output/gen_50k_p${i}.log 2>&1 &
+done
+
+tail -f output/gen_50k_p00.log
+
+damn bufferization!
+watch -n 10 'date; echo; for f in output/index_50k_rawish_50k_p*_answers.jsonl; do [ -e "$f" ] || continue; n=$(wc -l < "$f"); printf "%s: %d / 12500 (%.2f%%)\n" "$(basename "$f")" "$n" "$(awk -v n="$n" "BEGIN{print n/12500*100}")"; done; echo; total=$(cat output/index_50k_rawish_50k_p*_answers.jsonl 2>/dev/null | wc -l); printf "TOTAL: %d / 68019 (%.2f%%)\n" "$total" "$(awk -v n="$total" "BEGIN{print n/68019*100}")"; echo; echo "RUNTIME:"; ps -eo pid,etime,cmd | grep "eval/run_rag_hard_eval.py" | grep -v grep'
