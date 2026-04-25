@@ -13,7 +13,12 @@ from openai import OpenAI
 
 sys.path.append(".")
 
-from eval.run_rag_hard_eval import DEFAULT_BERT_MODEL, evaluate_answers, fetch_server_model_info
+from eval.run_rag_hard_eval import (
+    DEFAULT_BERT_MODEL,
+    compute_bertscore_max,
+    compute_exact_and_f1,
+    fetch_server_model_info,
+)
 from rag.constants import DEFAULT_LLM_MODEL
 
 
@@ -27,6 +32,22 @@ def build_prompt(question: str) -> str:
     return f"Answer the question directly and briefly.\n\nQuestion: {question}\nAnswer:"
 
 
+def count_jsonl_records(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    with path.open(encoding="utf-8") as fin:
+        for line_no, line in enumerate(fin, 1):
+            if not line.strip():
+                continue
+            try:
+                json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Broken JSON in {path} at line {line_no}. Fix or remove this line before resume.") from exc
+            total += 1
+    return total
+
+
 def generate_answers(
     input_path: Path,
     output_path: Path,
@@ -37,13 +58,21 @@ def generate_answers(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     client = OpenAI(base_url=base_url, api_key="not-needed")
-    processed = 0
+    resume_from = count_jsonl_records(output_path)
+    processed = resume_from
+    generated_now = 0
     started_at = time.time()
+    print(f"resume_from_generated_answers={resume_from}")
 
-    with input_path.open(encoding="utf-8") as fin, output_path.open("w", encoding="utf-8") as fout:
+    input_seen = 0
+    with input_path.open(encoding="utf-8") as fin, output_path.open("a", encoding="utf-8") as fout:
         for line in fin:
             if not line.strip():
                 continue
+            if input_seen < resume_from:
+                input_seen += 1
+                continue
+            input_seen += 1
             record = json.loads(line)
             question = record.get("input", "")
             response = client.chat.completions.create(
@@ -65,10 +94,117 @@ def generate_answers(
             fout.flush()
 
             processed += 1
+            generated_now += 1
             if processed % log_every == 0:
                 elapsed = time.time() - started_at
-                rate = processed / elapsed if elapsed > 0 else 0.0
+                rate = generated_now / elapsed if elapsed > 0 else 0.0
                 print(f"generated={processed} | elapsed_min={elapsed/60:.1f} | qps={rate:.3f}")
+
+    print(f"done_generation | generated_total={processed} | generated_now={generated_now}")
+
+
+def load_existing_results(results_path: Path) -> tuple[int, float, float, float]:
+    if not results_path.exists():
+        return 0, 0.0, 0.0, 0.0
+
+    total = 0
+    exact_sum = 0.0
+    f1_sum = 0.0
+    bert_sum = 0.0
+    with results_path.open(encoding="utf-8") as fin:
+        for line_no, line in enumerate(fin, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Broken JSON in {results_path} at line {line_no}. Fix or remove this line before resume.") from exc
+            total += 1
+            exact_sum += float(record.get("exact_match", 0.0))
+            f1_sum += float(record.get("token_f1", 0.0))
+            bert_sum += float(record.get("bertscore_f1", 0.0))
+    return total, exact_sum, f1_sum, bert_sum
+
+
+def iter_answer_chunks(answers_path: Path, skip: int, chunk_size: int):
+    chunk: list[dict[str, Any]] = []
+    seen = 0
+    with answers_path.open(encoding="utf-8") as fin:
+        for line in fin:
+            if not line.strip():
+                continue
+            if seen < skip:
+                seen += 1
+                continue
+            seen += 1
+            chunk.append(json.loads(line))
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+    if chunk:
+        yield chunk
+
+
+def score_answers(
+    answers_path: Path,
+    results_path: Path,
+    summary_path: Path,
+    model_info: dict[str, Any],
+    bert_model: str,
+    bert_batch_size: int,
+    bert_device: str,
+    bert_pair_batch_size: int,
+    score_chunk_size: int,
+) -> None:
+    answer_total = count_jsonl_records(answers_path)
+    total, exact_sum, f1_sum, bert_sum = load_existing_results(results_path)
+    if total > answer_total:
+        raise ValueError(f"Results contain {total} rows, but answers contain only {answer_total} rows.")
+    print(f"resume_from_scored_examples={total}")
+
+    with results_path.open("a", encoding="utf-8") as fout:
+        for chunk_idx, records in enumerate(iter_answer_chunks(answers_path, total, score_chunk_size), 1):
+            exact_scores, f1_scores = compute_exact_and_f1(records)
+            bert_scores = compute_bertscore_max(
+                records=records,
+                model_type=bert_model,
+                batch_size=bert_batch_size,
+                device=bert_device,
+                pair_batch_size=bert_pair_batch_size,
+            )
+
+            for record, exact_score, f1_score, bert_score_value in zip(records, exact_scores, f1_scores, bert_scores):
+                result_record = {
+                    **record,
+                    "exact_match": exact_score,
+                    "token_f1": f1_score,
+                    "bertscore_f1": bert_score_value,
+                }
+                fout.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+
+            total += len(records)
+            exact_sum += sum(exact_scores)
+            f1_sum += sum(f1_scores)
+            bert_sum += sum(bert_scores)
+            fout.flush()
+            print(f"scored_chunks={chunk_idx} | scored_examples={total}")
+
+            del records, exact_scores, f1_scores, bert_scores
+            gc.collect()
+
+    summary = {
+        "total_examples": total,
+        "mean_exact_match": exact_sum / total if total else 0.0,
+        "mean_token_f1": f1_sum / total if total else 0.0,
+        "mean_bertscore_f1": bert_sum / total if total else 0.0,
+        "llm_server": model_info,
+        "bertscore_model": bert_model,
+        "answers_path": str(answers_path),
+        "results_path": str(results_path),
+        "answer_total_at_scoring": answer_total,
+        "resumable": True,
+    }
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> None:
@@ -144,7 +280,7 @@ def main() -> None:
         return
 
     if args.stage == "score":
-        evaluate_answers(
+        score_answers(
             answers_path=answers_path,
             results_path=results_path,
             summary_path=summary_path,
