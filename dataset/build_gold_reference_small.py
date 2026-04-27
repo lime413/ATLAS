@@ -4,19 +4,211 @@ import argparse
 import json
 import sqlite3
 import time
+import re
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
-
-try:
-    from dataset.inspect_gold_pages_preprocessing import choose_gold_chunk
-except ImportError:
-    from inspect_gold_pages_preprocessing import choose_gold_chunk
 
 
 DEFAULT_RESULTS = Path("output/index_50k_rawish_50k_all_results.jsonl")
 DEFAULT_PAGES_DB = Path("data/wikipedia_pages_50k.sqlite")
 DEFAULT_OUTPUT = Path("data/gold_reference_small.jsonl")
+
+
+BAD_SECTIONS = {
+    "references",
+    "reference",
+    "external links",
+    "external link",
+    "see also",
+    "further reading",
+    "notes",
+    "footnotes",
+    "citations",
+    "sources",
+    "bibliography",
+    "works cited",
+    "general references",
+    "references and notes",
+    "notes and references",
+}
+
+
+COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+REF_RE = re.compile(r"<ref[^>]*>.*?</ref>|<ref[^/]*/>", re.DOTALL | re.IGNORECASE)
+HTML_RE = re.compile(r"<[^>]+>")
+HEADING_RE = re.compile(r"^\s*(={2,6})\s*(.*?)\s*\1\s*$")
+CATEGORY_RE = re.compile(r"\[\[Category:[^\]]+\]\]", re.IGNORECASE)
+FILE_RE = re.compile(r"\[\[(?:File|Image):[^\]]+\]\]", re.IGNORECASE)
+EXTERNAL_LINK_RE = re.compile(r"\[https?://[^\s\]]+\s*([^\]]*)\]")
+URL_RE = re.compile(r"https?://\S+")
+NON_WORD_RE = re.compile(r"[^a-z0-9]+")
+
+
+def clean_links(text: str) -> str:
+    text = EXTERNAL_LINK_RE.sub(lambda match: match.group(1).strip(), text)
+    text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
+    return text
+
+
+def preprocess_gold_page(
+    text: str,
+    *,
+    keep_infoboxes: bool = False,
+    keep_tables: bool = False,
+) -> str:
+    text = COMMENT_RE.sub("", text or "")
+    text = REF_RE.sub("", text)
+    text = remove_bad_sections(text)
+    text = CATEGORY_RE.sub("", text)
+    text = FILE_RE.sub("", text)
+    text = remove_table_and_template_blocks(text, keep_infoboxes=keep_infoboxes, keep_tables=keep_tables)
+    text = HTML_RE.sub("", text)
+    text = clean_links(text)
+    text = URL_RE.sub("", text)
+    text = re.sub(r"'{2,}", "", text)
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def remove_bad_sections(text: str) -> str:
+    out: list[str] = []
+    skip_level: int | None = None
+    for line in text.splitlines():
+        match = HEADING_RE.match(line)
+        if match:
+            level = len(match.group(1))
+            heading = re.sub(r"[^A-Za-z0-9 ]+", "", match.group(2)).strip().lower()
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+            if heading in BAD_SECTIONS:
+                skip_level = level
+                continue
+            continue
+        if skip_level is not None:
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def remove_table_and_template_blocks(
+    text: str,
+    *,
+    keep_infoboxes: bool = False,
+    keep_tables: bool = False,
+) -> str:
+    out: list[str] = []
+    skip_template = False
+    skip_table = False
+    depth = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if skip_table:
+            if stripped.startswith("|}"):
+                skip_table = False
+            continue
+        if stripped.startswith("{|") and not keep_tables:
+            skip_table = True
+            continue
+        if skip_template:
+            depth += stripped.count("{{") - stripped.count("}}")
+            if depth <= 0:
+                skip_template = False
+            continue
+        if stripped.startswith("{{") and not (keep_infoboxes and stripped.lower().startswith("{{infobox")):
+            depth = stripped.count("{{") - stripped.count("}}")
+            if depth > 0:
+                skip_template = True
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def normalize_with_map(text: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    index_map: list[int] = []
+    previous_space = True
+    for idx, char in enumerate(text.casefold()):
+        if char.isalnum():
+            chars.append(char)
+            index_map.append(idx)
+            previous_space = False
+        elif not previous_space:
+            chars.append(" ")
+            index_map.append(idx)
+            previous_space = True
+    if chars and chars[-1] == " ":
+        chars.pop()
+        index_map.pop()
+    return "".join(chars), index_map
+
+
+def find_answer_span(text: str, answers: list[str]) -> tuple[int | None, int | None, str | None]:
+    normalized_text, index_map = normalize_with_map(text)
+    for answer in sorted((a for a in answers if a), key=len, reverse=True):
+        normalized_answer = NON_WORD_RE.sub(" ", answer.casefold()).strip()
+        if not normalized_answer:
+            continue
+        pos = normalized_text.find(normalized_answer)
+        if pos >= 0:
+            start = index_map[pos]
+            end = index_map[pos + len(normalized_answer) - 1] + 1
+            return start, end, answer
+    return None, None, None
+
+
+def answer_window(text: str, answers: list[str], window_chars: int) -> tuple[str, int, int, str | None, bool]:
+    start, end, matched = find_answer_span(text, answers)
+    if start is None or end is None:
+        chunk = text[:window_chars]
+        return chunk, 0, len(chunk), None, False
+
+    center = (start + end) // 2
+    chunk_start = max(0, center - window_chars // 2)
+    chunk_end = min(len(text), chunk_start + window_chars)
+    chunk_start = max(0, chunk_end - window_chars)
+    return text[chunk_start:chunk_end], chunk_start, chunk_end, matched, True
+
+
+def choose_gold_chunk(text: str, answers: list[str], window_chars: int) -> dict[str, object]:
+    modes = [
+        ("without_infoboxes_or_tables", False, False),
+        ("with_infoboxes", True, False),
+        ("with_tables", False, True),
+        ("with_infoboxes_and_tables", True, True),
+    ]
+
+    fallback_text = ""
+    fallback_mode = "with_infoboxes_and_tables"
+    for mode, keep_infoboxes, keep_tables in modes:
+        preprocessed = preprocess_gold_page(text, keep_infoboxes=keep_infoboxes, keep_tables=keep_tables)
+        chunk, start, end, matched, found = answer_window(preprocessed, answers, window_chars)
+        if mode == fallback_mode:
+            fallback_text = preprocessed
+        if found:
+            return {
+                "preprocessing_mode": mode,
+                "preprocessed_chars": len(preprocessed),
+                "chunk": chunk,
+                "chunk_start": start,
+                "chunk_end": end,
+                "matched_answer": matched,
+                "found_answer": True,
+            }
+
+    chunk = fallback_text[:window_chars]
+    return {
+        "preprocessing_mode": fallback_mode,
+        "preprocessed_chars": len(fallback_text),
+        "chunk": chunk,
+        "chunk_start": 0,
+        "chunk_end": len(chunk),
+        "matched_answer": None,
+        "found_answer": False,
+    }
 
 
 class PageCache:
