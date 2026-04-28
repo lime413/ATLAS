@@ -298,6 +298,7 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output instead of resuming.")
     parser.add_argument("--dry-run", action="store_true", help="Build prompts and output JSON without API calls.")
     parser.add_argument("--print-log", action="store_true", help="Include per-sample log lines.")
+    parser.add_argument("--retries", type=int, default=2, help="Retry failed model requests. Default 2 means 3 total tries.")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -318,6 +319,7 @@ def main() -> None:
         "model": args.model,
         "limit": sample_limit,
         "max_retrieved_chunks": args.max_retrieved_chunks,
+        "retries": args.retries,
         "include_correct": bool(args.include_correct),
         "skip_correct_rule": {
             "exact_match": ">= 1.0",
@@ -332,10 +334,12 @@ def main() -> None:
         skipped_missing_gold = payload["meta"]["skipped_missing_gold"]
         scanned = payload["meta"]["scanned_candidates"]
         requests_sent = payload["meta"]["requests_sent"]
+        model_errors = int(payload["meta"].get("model_errors", 0) or 0)
     else:
         skipped_missing_gold = 0
         scanned = 0
         requests_sent = 0
+        model_errors = 0
 
     with open_passages_db(Path(args.passages_db)) as passages_conn, tqdm(
         total=sample_limit,
@@ -363,11 +367,22 @@ def main() -> None:
                 skipped_missing_gold += 1
                 pbar.set_postfix(scanned=scanned, skipped_missing_gold=skipped_missing_gold, refresh=False)
                 continue
-            output = (
-                "DRY RUN: prompt was built but not sent."
-                if args.dry_run
-                else call_model(args.base_url, args.model, prompt, args.max_output_tokens).strip()
-            )
+            model_error = None
+            if args.dry_run:
+                output = "DRY RUN: prompt was built but not sent."
+            else:
+                try:
+                    output = call_model(
+                        args.base_url,
+                        args.model,
+                        prompt,
+                        args.max_output_tokens,
+                        retries=args.retries,
+                    ).strip()
+                except Exception as exc:
+                    model_error = str(exc)
+                    output = f"ERROR: {model_error}"
+                    model_errors += 1
             if not args.dry_run:
                 requests_sent += 1
             processed += 1
@@ -380,12 +395,15 @@ def main() -> None:
                 "bertscore_f1": record.get("bertscore_f1"),
                 "skipped_missing_gold_before": skipped_missing_gold,
             }
+            if model_error is not None:
+                item["model_error"] = model_error
             if args.include_prompts:
                 item["prompt"] = prompt
             payload["items"].append(item)
             payload["meta"]["skipped_missing_gold"] = skipped_missing_gold
             payload["meta"]["scanned_candidates"] = scanned
             payload["meta"]["requests_sent"] = requests_sent
+            payload["meta"]["model_errors"] = model_errors
             save_output(output_path, payload)
             pbar.update(1)
             pbar.set_postfix(scanned=scanned, skipped_missing_gold=skipped_missing_gold, refresh=False)
