@@ -11,8 +11,8 @@ from typing import Any
 import requests
 from tqdm import tqdm
 
-DEFAULT_INPUT = Path("output/index_50k_rawish_50k_all_results.jsonl")
-DEFAULT_OUTPUT = Path("output/index_50k_rawish_50k_all_answer_scores.json")
+DEFAULT_INPUT = Path("output/rag_raw/index_50k_rawish_50k_all_results.jsonl")
+DEFAULT_OUTPUT = Path("output/rag_raw/index_50k_rawish_50k_llm_scores.json")
 DEFAULT_TEMPLATE = Path("eval/rag_answer_score_prompt_template.md")
 DEFAULT_GOLD_REFERENCE_SMALL = Path("data/gold_reference_small.jsonl")
 DEFAULT_PASSAGES_DB = Path("data/index_50k_rawish/passages.sqlite")
@@ -31,7 +31,7 @@ def load_template(path: Path) -> str:
 
 def load_existing(path: Path, overwrite: bool) -> dict[str, Any]:
     if overwrite or not path.exists():
-        return {"items": []}
+        return False, {"items": []}
     with path.open(encoding="utf-8") as fin:
         payload = json.load(fin)
     if isinstance(payload, list):
@@ -44,7 +44,7 @@ def load_existing(path: Path, overwrite: bool) -> dict[str, Any]:
             item["output"] = item.pop("analysis")
         elif "analysis" in item:
             item.pop("analysis")
-    return payload
+    return True, payload
 
 
 def save_output(path: Path, payload: dict[str, Any]) -> None:
@@ -253,7 +253,7 @@ def extract_chat_completion_text(payload: dict[str, Any]) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
-def call_model(base_url: str, model: str, prompt: str, max_output_tokens: int, retries: int) -> str:
+def call_model(base_url: str, model: str, prompt: str, max_output_tokens: int, retries: int = 2) -> str:
     url = f"{base_url.rstrip('/')}/chat/completions"
     request_payload = {
         "model": model,
@@ -279,14 +279,6 @@ def call_model(base_url: str, model: str, prompt: str, max_output_tokens: int, r
     raise RuntimeError(f"Model request failed: {last_error}") from last_error
 
 
-def wait_for_rate_limit(requests_sent: int, requests_per_minute: int, pbar: tqdm | None) -> None:
-    if requests_per_minute <= 0 or requests_sent <= 0 or requests_sent % requests_per_minute != 0:
-        return
-    if pbar is not None:
-        pbar.set_postfix(wait_s=60, refresh=True)
-    time.sleep(60)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ask a local LLM server to judge RAG answers.")
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="RAG results JSONL file.")
@@ -299,18 +291,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Number of new samples to process. Use 0 for no limit.")
     parser.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS, help="Max tokens in the model response.")
     parser.add_argument("--max-retrieved-chunks", type=int, default=5)
-    parser.add_argument(
-        "--include-correct",
-        action="store_true",
-        default=False,
-        help="Process likely correct rows. This is disabled by default.",
-    )
+    parser.add_argument("--include-correct", action="store_true", help="Process likely correct rows. This is disabled by default.")
     parser.add_argument("--token-f1-correct-threshold", type=float, default=DEFAULT_TOKEN_F1_CORRECT_THRESHOLD)
     parser.add_argument("--bertscore-correct-threshold", type=float, default=DEFAULT_BERTSCORE_CORRECT_THRESHOLD)
     parser.add_argument("--include-prompts", action="store_true", help="Store filled prompts in the output JSON.")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output instead of resuming.")
     parser.add_argument("--dry-run", action="store_true", help="Build prompts and output JSON without API calls.")
-    parser.add_argument("--quiet", action="store_true", help="Hide per-sample log lines and show only tqdm progress.")
+    parser.add_argument("--print-log", action="store_true", help="Include per-sample log lines.")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -318,7 +305,7 @@ def main() -> None:
     sample_limit = args.limit if args.limit > 0 else None
 
     template = load_template(Path(args.template))
-    payload = load_existing(output_path, args.overwrite)
+    resume, payload = load_existing(output_path, args.overwrite)
     seen_ids = {str(item.get("id")) for item in payload.get("items", [])}
     gold_chunks = load_gold_reference_chunks(Path(args.gold_reference_small))
 
@@ -330,7 +317,6 @@ def main() -> None:
         "base_url": args.base_url,
         "model": args.model,
         "limit": sample_limit,
-        "output_mode": args.output_mode,
         "max_retrieved_chunks": args.max_retrieved_chunks,
         "include_correct": bool(args.include_correct),
         "skip_correct_rule": {
@@ -341,10 +327,16 @@ def main() -> None:
     }
     payload.setdefault("items", [])
 
-    skipped_missing_gold = 0
     processed = 0
-    scanned = 0
-    requests_sent = 0
+    if resume:
+        skipped_missing_gold = payload["meta"]["skipped_missing_gold"]
+        scanned = payload["meta"]["scanned_candidates"]
+        requests_sent = payload["meta"]["requests_sent"]
+    else:
+        skipped_missing_gold = 0
+        scanned = 0
+        requests_sent = 0
+
     with open_passages_db(Path(args.passages_db)) as passages_conn, tqdm(
         total=sample_limit,
         desc="processing",
@@ -374,7 +366,7 @@ def main() -> None:
             output = (
                 "DRY RUN: prompt was built but not sent."
                 if args.dry_run
-                else call_model(args.base_url, args.model, prompt, args.max_output_tokens, args.retries).strip()
+                else call_model(args.base_url, args.model, prompt, args.max_output_tokens).strip()
             )
             if not args.dry_run:
                 requests_sent += 1
@@ -394,14 +386,11 @@ def main() -> None:
             payload["meta"]["skipped_missing_gold"] = skipped_missing_gold
             payload["meta"]["scanned_candidates"] = scanned
             payload["meta"]["requests_sent"] = requests_sent
-            payload["meta"]["requests_per_minute"] = args.requests_per_minute
             save_output(output_path, payload)
             pbar.update(1)
             pbar.set_postfix(scanned=scanned, skipped_missing_gold=skipped_missing_gold, refresh=False)
-            if not args.quiet:
+            if args.print_log:
                 tqdm.write(f"processed={processed} id={record.get('id')}")
-            if sample_limit is None or processed < sample_limit:
-                wait_for_rate_limit(requests_sent, args.requests_per_minute, pbar)
 
 
 if __name__ == "__main__":
