@@ -310,23 +310,24 @@ def main() -> None:
     seen_ids = {str(item.get("id")) for item in payload.get("items", [])}
     gold_chunks = load_gold_reference_chunks(Path(args.gold_reference_small))
 
-    payload["meta"] = {
-        "input": str(input_path),
-        "template": str(args.template),
-        "gold_reference_small": str(args.gold_reference_small),
-        "passages_db": str(args.passages_db),
-        "base_url": args.base_url,
-        "model": args.model,
-        "limit": sample_limit,
-        "max_retrieved_chunks": args.max_retrieved_chunks,
-        "retries": args.retries,
-        "include_correct": bool(args.include_correct),
-        "skip_correct_rule": {
-            "exact_match": ">= 1.0",
-            "token_f1": f"> {args.token_f1_correct_threshold}",
-            "bertscore_f1": f"> {args.bertscore_correct_threshold}",
-        },
-    }
+    if not resume:
+        payload["meta"] = {
+            "input": str(input_path),
+            "template": str(args.template),
+            "gold_reference_small": str(args.gold_reference_small),
+            "passages_db": str(args.passages_db),
+            "base_url": args.base_url,
+            "model": args.model,
+            "limit": sample_limit,
+            "max_retrieved_chunks": args.max_retrieved_chunks,
+            "retries": args.retries,
+            "include_correct": bool(args.include_correct),
+            "skip_correct_rule": {
+                "exact_match": ">= 1.0",
+                "token_f1": f"> {args.token_f1_correct_threshold}",
+                "bertscore_f1": f"> {args.bertscore_correct_threshold}",
+            },
+        }
     payload.setdefault("items", [])
 
     processed = 0

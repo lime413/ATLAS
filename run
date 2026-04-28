@@ -55,3 +55,29 @@ python dataset/inspect_structured_pages.py \
   --raw-db data/wikipedia_pages_50k.sqlite \
   --structured-jsonl data/structured_pages_sample_20.jsonl \
   --port 8090
+
+mkdir -p output/mistake_analysis_shards output/mistake_analysis_parts && \
+split -n l/4 -d -a 2 --additional-suffix=.jsonl \
+  output/rag_raw/index_50k_rawish_50k_all_results.jsonl \
+  output/mistake_analysis_shards/results_part_
+
+for i in 00 01 02 03; do
+  CUDA_VISIBLE_DEVICES=3 \
+  PYTHONUNBUFFERED=1 \
+  nohup python -u eval/run_mistake_analysis.py \
+    --input output/mistake_analysis_shards/results_part_${i}.jsonl \
+    --output output/mistake_analysis_parts/index_50k_rawish_50k_all_answer_scores_p${i}.json \
+    --include-correct \
+    > output/mistake_analysis_parts/mistake_p${i}.log 2>&1 &
+done
+
+watch -n 1 'python -c "import glob,json; total=68019; n=0; files=glob.glob(\"output/mistake_analysis_parts/*_answer_scores_p*.json\"); 
+for f in files:
+    try:
+        d=json.load(open(f))
+        n += int(d.get(\"meta\", {}).get(\"scanned_candidates\", 0) or 0)
+    except Exception:
+        pass
+print(f\"{n/total*100:.2f}% ({n}/{total}) files={len(files)}\")"'
+
+pkill -f "eval/run_mistake_analysis.py"
