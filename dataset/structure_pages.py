@@ -18,6 +18,23 @@ EXTERNAL_LINK_RE = re.compile(r"\[https?://[^\s\]]+\s*([^\]]*)\]")
 WIKI_LINK_WITH_LABEL_RE = re.compile(r"\[\[[^\]|]+\|([^\]]+)\]\]")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 TEMPLATE_NAME_RE = re.compile(r"^\s*\{\{\s*([^|\n{}]+)", re.IGNORECASE)
+BAD_SECTIONS = {
+    "references",
+    "reference",
+    "external links",
+    "external link",
+    "see also",
+    "further reading",
+    "notes",
+    "footnotes",
+    "citations",
+    "sources",
+    "bibliography",
+    "works cited",
+    "general references",
+    "references and notes",
+    "notes and references",
+}
 
 
 def normalize_space(text: str) -> str:
@@ -126,6 +143,10 @@ def parse_infobox(block: str) -> list[dict[str, str]]:
         inner = inner[2:]
     if inner.endswith("}}"):
         inner = inner[:-2]
+    first_field = re.search(r"\n\s*\|", inner)
+    if first_field is not None:
+        inner = inner[first_field.start() + 1 :]
+    inner = re.sub(r"\n\s*\|", "\n|", inner)
 
     fields = []
     for part in split_top_level(inner, "\n|"):
@@ -180,6 +201,53 @@ def parse_table(block: str, max_rows: int) -> dict[str, object] | None:
     }
 
 
+def format_infobox_facts(infobox: list[dict[str, str]]) -> list[str]:
+    facts = []
+    for field in infobox:
+        key = field.get("key", "").strip()
+        value = field.get("value", "").strip()
+        if key and value:
+            facts.append(f"Infobox field: {key} = {value}")
+    return facts
+
+
+def format_table_facts(tables: list[dict[str, object]]) -> list[str]:
+    facts = []
+    for table in tables:
+        caption = str(table.get("caption") or "").strip()
+        headers = [str(header).strip() for header in table.get("headers", []) if str(header).strip()]
+        for row in table.get("rows", []):
+            cells = [str(cell).strip() for cell in row if str(cell).strip()]
+            if not cells:
+                continue
+            pairs = []
+            if headers and len(headers) == len(cells):
+                pairs = [f"{header} = {cell}" for header, cell in zip(headers, cells)]
+            else:
+                pairs = [f"cell_{idx + 1} = {cell}" for idx, cell in enumerate(cells)]
+            prefix = f"Table row: {caption}; " if caption else "Table row: "
+            facts.append(prefix + "; ".join(pairs))
+    return facts
+
+
+def build_clean_text(
+    title: str,
+    lead: str,
+    sections: list[dict[str, object]],
+    facts: list[str],
+) -> str:
+    parts = [f"Title: {title}"]
+    parts.extend(facts)
+    if lead:
+        parts.append(f"Lead: {lead}")
+    for section in sections:
+        heading = str(section.get("heading") or "").strip()
+        body = str(section.get("text") or "").strip()
+        if heading and body:
+            parts.append(f"Section: {heading}\n{body}")
+    return normalize_space("\n\n".join(parts))
+
+
 def extract_infoboxes(text: str) -> tuple[list[dict[str, str]], list[tuple[int, int]]]:
     infoboxes: list[dict[str, str]] = []
     spans = []
@@ -213,6 +281,9 @@ def parse_sections(text: str) -> tuple[str, list[dict[str, object]]]:
         content_start = match.end()
         content_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
         heading = clean_value(match.group(2))
+        normalized_heading = re.sub(r"[^A-Za-z0-9 ]+", "", heading).strip().lower()
+        if normalized_heading in BAD_SECTIONS:
+            continue
         body = clean_value(text[content_start:content_end])
         if heading and body:
             sections.append(
@@ -231,19 +302,30 @@ def structure_page(wikipedia_id: str, title: str, raw_text: str, max_table_rows:
     tables, table_spans = extract_tables(text, max_rows=max_table_rows)
     text_without_blocks = remove_spans(text, infobox_spans + table_spans)
     lead, sections = parse_sections(text_without_blocks)
+    infobox_facts = format_infobox_facts(infobox)
+    table_facts = format_table_facts(tables)
+    facts = infobox_facts + table_facts
+    clean_text = build_clean_text(title=title, lead=lead, sections=sections, facts=facts)
     return {
-        "schema_version": "atlas_structured_page_v1",
+        "schema_version": "atlas_structured_page_v2",
         "wikipedia_id": str(wikipedia_id),
         "title": title,
+        "clean_text": clean_text,
+        "facts": facts,
         "lead": lead,
         "infobox": infobox,
+        "infobox_facts": infobox_facts,
         "sections": sections,
         "tables": tables,
+        "table_facts": table_facts,
         "stats": {
             "infobox_fields": len(infobox),
+            "infobox_facts": len(infobox_facts),
             "sections": len(sections),
             "tables": len(tables),
+            "table_facts": len(table_facts),
             "raw_chars": len(raw_text or ""),
+            "clean_chars": len(clean_text),
             "lead_chars": len(lead),
         },
     }
