@@ -1,3 +1,6 @@
+##########################################################################
+run_rag_hard_eval.py - 4 shards
+
 for i in 00 01 02 03; do
   CUDA_VISIBLE_DEVICES=2 \
   ATLAS_EMBED_DEVICE=cuda \
@@ -30,6 +33,9 @@ watch -n 10 'date; echo; for f in output/index_50k_rawish_50k_p*_answers.jsonl; 
 score progress
 watch -n 5 'awk -v total=68019 '\''/scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); done=b[1]} END{printf "%.2f%%\n", (done/total)*100}'\'' output/score_50k_all.log'
 
+##########################################################################
+run_llm_only_eval.py
+
 CUDA_VISIBLE_DEVICES=2 \
 PYTHONUNBUFFERED=1 \
 python eval/run_llm_only_eval.py \
@@ -50,11 +56,16 @@ watch -n 5 'awk -v total=68019 '\''/generated=/{split($0,a,"generated="); split(
 score progress
 watch -n 5 'awk -v total=68019 '\''/scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); done=b[1]} END{printf "%.2f%%\n", (done/total)*100}'\'' output/llm_only_train_hard_score.log'
 
+##########################################################################
 web with structured pages
+
 python dataset/inspect_structured_pages.py \
   --raw-db data/wikipedia_pages_50k.sqlite \
   --structured-jsonl data/structured_pages_sample_20.jsonl \
   --port 8090
+
+##########################################################################
+scoring with llm-as-judge 4 shards
 
 mkdir -p output/mistake_analysis_shards output/mistake_analysis_parts && \
 split -n l/4 -d -a 2 --additional-suffix=.jsonl \
@@ -81,3 +92,25 @@ for f in files:
 print(f\"{n/total*100:.2f}% ({n}/{total}) files={len(files)}\")"'
 
 pkill -f "eval/run_mistake_analysis.py"
+
+##########################################################################
+generating structured pages 4 shards
+
+mkdir -p data/structured_shards output
+
+for i in 0 1 2 3; do
+  PYTHONUNBUFFERED=1 \
+  nohup python -u dataset/structure_pages.py \
+    --db data/wikipedia_pages_50k.sqlite \
+    --output data/structured_shards/structured_pages_50k_part_${i}.jsonl \
+    --limit 0 \
+    --num-shards 4 \
+    --shard-index $i \
+    --max-table-rows 20 \
+    --log-every 1000 \
+    > output/structure_pages_p${i}.log 2>&1 &
+done
+
+watch -n 10 'done=$(wc -l data/structured_shards/structured_pages_50k_part_*.jsonl 2>/dev/null | awk "/total/{print \$1}"); total=$(sqlite3 data/wikipedia_pages_50k.sqlite "select count(*) from pages;"); awk -v d="${done:-0}" -v t="$total" "BEGIN{printf \"structured: %d / %d (%.2f%%)\\n\", d, t, d/t*100}"'
+
+cat data/structured_shards/structured_pages_50k_part_*.jsonl > data/structured_pages_50k.jsonl

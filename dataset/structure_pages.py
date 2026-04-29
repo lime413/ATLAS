@@ -331,14 +331,25 @@ def structure_page(wikipedia_id: str, title: str, raw_text: str, max_table_rows:
     }
 
 
-def iter_pages(db_path: Path, limit: int | None) -> Iterable[sqlite3.Row]:
+def iter_pages(db_path: Path, limit: int | None, num_shards: int, shard_index: int) -> Iterable[sqlite3.Row]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     query = "SELECT wikipedia_id, title, text FROM pages ORDER BY wikipedia_id"
-    params: tuple[int, ...] = ()
+    params: tuple[int, int] | tuple[int, int, int]
+    if num_shards > 1:
+        query = (
+            "SELECT wikipedia_id, title, text FROM ("
+            "SELECT wikipedia_id, title, text, (ROW_NUMBER() OVER (ORDER BY wikipedia_id) - 1) AS row_idx "
+            "FROM pages"
+            ") WHERE row_idx % ? = ? ORDER BY wikipedia_id"
+        )
+        params = (num_shards, shard_index)
+    else:
+        params = ()
+
     if limit is not None and limit > 0:
         query += " LIMIT ?"
-        params = (limit,)
+        params = (*params, limit)
     try:
         for row in conn.execute(query, params):
             yield row
@@ -346,11 +357,19 @@ def iter_pages(db_path: Path, limit: int | None) -> Iterable[sqlite3.Row]:
         conn.close()
 
 
-def write_structured_jsonl(db_path: Path, output: Path, limit: int | None, max_table_rows: int, log_every: int) -> None:
+def write_structured_jsonl(
+    db_path: Path,
+    output: Path,
+    limit: int | None,
+    max_table_rows: int,
+    log_every: int,
+    num_shards: int,
+    shard_index: int,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     with output.open("w", encoding="utf-8") as fout:
-        for row in iter_pages(db_path, limit):
+        for row in iter_pages(db_path, limit, num_shards, shard_index):
             record = structure_page(
                 wikipedia_id=row["wikipedia_id"],
                 title=row["title"],
@@ -361,7 +380,7 @@ def write_structured_jsonl(db_path: Path, output: Path, limit: int | None, max_t
             total += 1
             if total % log_every == 0:
                 print(f"structured_pages={total}")
-    print(f"done | structured_pages={total} | output={output}")
+    print(f"done | shard={shard_index}/{num_shards} | structured_pages={total} | output={output}")
 
 
 def main() -> None:
@@ -371,7 +390,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--max-table-rows", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards)")
 
     write_structured_jsonl(
         db_path=args.db,
@@ -379,6 +404,8 @@ def main() -> None:
         limit=args.limit,
         max_table_rows=args.max_table_rows,
         log_every=args.log_every,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
 
 
