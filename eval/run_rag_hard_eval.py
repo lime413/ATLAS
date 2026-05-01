@@ -78,6 +78,38 @@ def fetch_server_model_info(base_url: str) -> dict[str, Any]:
     }
 
 
+def count_jsonl_records(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    with path.open(encoding="utf-8") as fin:
+        for line in fin:
+            if line.strip():
+                total += 1
+    return total
+
+
+def load_existing_score_state(path: Path) -> dict[str, float | int]:
+    state: dict[str, float | int] = {
+        "total": 0,
+        "exact_sum": 0.0,
+        "f1_sum": 0.0,
+        "bert_sum": 0.0,
+    }
+    if not path.exists():
+        return state
+    with path.open(encoding="utf-8") as fin:
+        for line in fin:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            state["total"] = int(state["total"]) + 1
+            state["exact_sum"] = float(state["exact_sum"]) + float(record.get("exact_match") or 0.0)
+            state["f1_sum"] = float(state["f1_sum"]) + float(record.get("token_f1") or 0.0)
+            state["bert_sum"] = float(state["bert_sum"]) + float(record.get("bertscore_f1") or 0.0)
+    return state
+
+
 def build_prompt(question: str, passages: list[dict[str, Any]]) -> str:
     context = "\n\n".join(f"[{i + 1}] {p['text']}" for i, p in enumerate(passages))
     return (
@@ -86,6 +118,49 @@ def build_prompt(question: str, passages: list[dict[str, Any]]) -> str:
         f"Question: {question}\n"
         "Answer:"
     )
+
+
+def is_context_size_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "context" in text and ("exceeded" in text or "too large" in text or "too long" in text)
+
+
+def candidate_top_ks(top_k: int) -> list[int]:
+    values = []
+    for value in (top_k, 3, 1):
+        value = max(1, int(value))
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def generate_with_context_fallback(
+    client: OpenAI,
+    model: str,
+    question: str,
+    passages: list[dict[str, Any]],
+    top_ks: list[int],
+    max_tokens: int,
+) -> tuple[str, list[dict[str, Any]], int, int]:
+    last_context_error: Exception | None = None
+    for fallback_top_k in top_ks:
+        selected_passages = passages[:fallback_top_k]
+        prompt = build_prompt(question, selected_passages)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            answer = (response.choices[0].message.content or "").strip()
+            return answer, selected_passages, fallback_top_k, len(prompt)
+        except Exception as exc:
+            if not is_context_size_error(exc):
+                raise
+            last_context_error = exc
+            continue
+    raise RuntimeError(f"Context size exceeded for all fallback top-k values: {top_ks}") from last_context_error
 
 
 def generate_answers(
@@ -106,13 +181,23 @@ def generate_answers(
     index = load_index(index_dir)
     client = OpenAI(base_url=base_url, api_key="not-needed")
 
+    resume_from = count_jsonl_records(output_path)
+    if resume_from:
+        print(f"resume_generate_from={resume_from} | output={output_path}")
+
     beb = max(1, int(query_embed_batch))
-    processed = 0
+    processed = resume_from
+    written = resume_from
+    skipped_context = 0
+    fallback_top3 = 0
+    fallback_top1 = 0
+    original_top_k_ok = 0
     started_at = time.time()
     pending: list[dict[str, Any]] = []
+    top_ks = candidate_top_ks(top_k)
 
     def flush_pending(fout) -> None:
-        nonlocal pending, processed
+        nonlocal fallback_top1, fallback_top3, original_top_k_ok, pending, processed, skipped_context, written
         if not pending:
             return
         batch = pending
@@ -131,20 +216,39 @@ def generate_answers(
             passages = retrieve(
                 query=question,
                 index=index,
-                top_k=top_k,
+                top_k=max(top_ks),
                 dense_limit=dense_limit,
                 sparse_limit=sparse_limit,
                 sparse_weight=sparse_weight,
                 query_embedding=qemb,
             )
-            prompt = build_prompt(question, passages)
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=max_tokens,
-            )
-            llm_answer = (response.choices[0].message.content or "").strip()
+            skipped = False
+            skip_reason = ""
+            prompt_chars = 0
+            used_top_k = 0
+            try:
+                llm_answer, used_passages, used_top_k, prompt_chars = generate_with_context_fallback(
+                    client=client,
+                    model=model,
+                    question=question,
+                    passages=passages,
+                    top_ks=top_ks,
+                    max_tokens=max_tokens,
+                )
+                if used_top_k == top_k:
+                    original_top_k_ok += 1
+                elif used_top_k == 3:
+                    fallback_top3 += 1
+                elif used_top_k == 1:
+                    fallback_top1 += 1
+            except RuntimeError as exc:
+                if not is_context_size_error(exc) and "context size exceeded" not in str(exc).lower():
+                    raise
+                skipped = True
+                skipped_context += 1
+                llm_answer = ""
+                used_passages = []
+                skip_reason = "context_size_exceeded"
 
             answer_record = {
                 "id": record.get("id"),
@@ -152,6 +256,10 @@ def generate_answers(
                 "wikipedia_id": record.get("wikipedia_id", []),
                 "gold_answers": gold_answers,
                 "llm_answer": llm_answer,
+                "used_top_k": used_top_k,
+                "prompt_chars": prompt_chars,
+                "skipped": skipped,
+                "skip_reason": skip_reason,
                 "sources": [
                     {
                         "chunk_id": passage["chunk_id"],
@@ -159,27 +267,43 @@ def generate_answers(
                         "title": passage["title"],
                         "chunk_idx": passage["chunk_idx"],
                     }
-                    for passage in passages
+                    for passage in used_passages
                 ],
             }
             fout.write(json.dumps(answer_record, ensure_ascii=False) + "\n")
             fout.flush()
 
             processed += 1
+            written += 1
             if processed % log_every == 0:
                 elapsed = time.time() - started_at
                 rate = processed / elapsed if elapsed > 0 else 0.0
-                print(f"generated={processed} | elapsed_min={elapsed/60:.1f} | qps={rate:.3f}")
+                print(
+                    f"generated={processed} | written={written} | "
+                    f"top_k_ok={original_top_k_ok} | fallback_top3={fallback_top3} | "
+                    f"fallback_top1={fallback_top1} | skipped_context={skipped_context} | "
+                    f"elapsed_min={elapsed/60:.1f} | qps={rate:.3f}"
+                )
 
     try:
-        with input_path.open(encoding="utf-8") as fin, output_path.open("w", encoding="utf-8") as fout:
+        mode = "a" if resume_from else "w"
+        with input_path.open(encoding="utf-8") as fin, output_path.open(mode, encoding="utf-8") as fout:
+            skipped_existing = 0
             for line in fin:
                 if not line.strip():
+                    continue
+                if skipped_existing < resume_from:
+                    skipped_existing += 1
                     continue
                 pending.append(json.loads(line))
                 if len(pending) >= beb:
                     flush_pending(fout)
             flush_pending(fout)
+            print(
+                f"generation_summary | generated={processed} | written={written} | "
+                f"top_k_ok={original_top_k_ok} | fallback_top3={fallback_top3} | "
+                f"fallback_top1={fallback_top1} | skipped_context={skipped_context}"
+            )
     finally:
         close_index(index)
 
@@ -260,16 +384,24 @@ def evaluate_answers(
     bert_pair_batch_size: int,
     score_chunk_size: int,
 ) -> None:
-    total = 0
-    exact_sum = 0.0
-    f1_sum = 0.0
-    bert_sum = 0.0
+    existing = load_existing_score_state(results_path)
+    resume_from = int(existing["total"])
+    total = resume_from
+    exact_sum = float(existing["exact_sum"])
+    f1_sum = float(existing["f1_sum"])
+    bert_sum = float(existing["bert_sum"])
+    if resume_from:
+        print(f"resume_score_from={resume_from} | results={results_path}")
 
     def iter_chunks():
         chunk: list[dict[str, Any]] = []
+        skipped_existing = 0
         with answers_path.open(encoding="utf-8") as fin:
             for line in fin:
                 if not line.strip():
+                    continue
+                if skipped_existing < resume_from:
+                    skipped_existing += 1
                     continue
                 chunk.append(json.loads(line))
                 if len(chunk) >= score_chunk_size:
@@ -278,7 +410,8 @@ def evaluate_answers(
         if chunk:
             yield chunk
 
-    with results_path.open("w", encoding="utf-8") as fout:
+    mode = "a" if resume_from else "w"
+    with results_path.open(mode, encoding="utf-8") as fout:
         for chunk_idx, records in enumerate(iter_chunks(), 1):
             exact_scores, f1_scores = compute_exact_and_f1(records)
             bert_scores = compute_bertscore_max(
