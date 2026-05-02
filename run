@@ -1,4 +1,46 @@
 ##########################################################################
+python processes
+
+ps -eo pid,etime,cmd | grep run_rag_hard_eval | grep -v grep
+
+pkill -f run_rag_hard_eval
+
+##########################################################################
+llama server
+
+CUDA_VISIBLE_DEVICES=0 \
+/mnt/ssd/apinigin/llama.cpp/build/bin/llama-server \
+  -m models/gemma3/gemma-3-4b-it-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 8192 \
+  --host 127.0.0.1 \
+  --port 8082
+
+CUDA_VISIBLE_DEVICES=1 \
+/mnt/ssd/apinigin/llama.cpp/build/bin/llama-server \
+  -m models/gemma3/gemma-3-4b-it-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 8192 \
+  --host 127.0.0.1 \
+  --port 8084
+
+CUDA_VISIBLE_DEVICES=2 \
+/mnt/ssd/apinigin/llama.cpp/build/bin/llama-server \
+  -m models/gemma3/gemma-3-4b-it-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 8192 \
+  --host 127.0.0.1 \
+  --port 8085
+
+CUDA_VISIBLE_DEVICES=3 \
+/mnt/ssd/apinigin/llama.cpp/build/bin/llama-server \
+  -m models/gemma3/gemma-3-4b-it-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 8192 \
+  --host 127.0.0.1 \
+  --port 8086
+
+##########################################################################
 run_rag_hard_eval.py - 4 shards
 
 for i in 00 01 02 03; do
@@ -114,3 +156,81 @@ done
 watch -n 10 'done=$(wc -l data/structured_shards/structured_pages_50k_part_*.jsonl 2>/dev/null | awk "/total/{print \$1}"); total=$(sqlite3 data/wikipedia_pages_50k.sqlite "select count(*) from pages;"); awk -v d="${done:-0}" -v t="$total" "BEGIN{printf \"structured: %d / %d (%.2f%%)\\n\", d, t, d/t*100}"'
 
 cat data/structured_shards/structured_pages_50k_part_*.jsonl > data/structured_pages_50k.jsonl
+
+##########################################################################
+indexing structured pages
+
+CUDA_VISIBLE_DEVICES=0 \
+ATLAS_EMBED_DEVICE=cuda \
+ATLAS_EMBED_TORCH_DTYPE=float16 \
+ATLAS_TORCH_INTRAOP_THREADS=4 \
+ATLAS_TORCH_INTEROP_THREADS=1 \
+PYTHONUNBUFFERED=1 \
+nohup python -u rag/index_structured.py \
+  --input data/structured_pages_50k.jsonl \
+  --index-dir data/index_50k_structured \
+  --embed-batch 128 \
+  --page-batch 128 \
+  --flush-chunks 4096 \
+  > output/index_structured_50k.log 2>&1 &
+
+gpu usage
+watch -n 1 'nvidia-smi --query-gpu=index,name,memory.used,memory.free,utilization.gpu --format=csv'
+
+##########################################################################
+rag with structured pages
+
+for i in 00 01; do
+  CUDA_VISIBLE_DEVICES=4 \
+  ATLAS_EMBED_DEVICE=cuda \
+  ATLAS_TORCH_INTRAOP_THREADS=4 \
+  ATLAS_TORCH_INTEROP_THREADS=1 \
+  OMP_NUM_THREADS=12 \
+  PYTHONUNBUFFERED=1 \
+  nohup python -u eval/run_rag_hard_eval.py \
+    --stage generate \
+    --input data/train_hard_rest_shards/part_${i}.jsonl \
+    --index-dir data/index_50k_structured \
+    --base-url http://127.0.0.1:8082/v1 \
+    --model gemma-3-4b-it-Q4_K_M.gguf \
+    --run-name index_structured_rest_p${i} \
+    --top-k 5 \
+    --dense-limit 20 \
+    --sparse-limit 20 \
+    --sparse-weight 0.3 \
+    --query-embed-batch 128 \
+    --max-tokens 96 \
+    --log-every 100 \
+    > output/gen_structured_p${i}.log 2>&1 &
+done
+
+generation progress
+watch -n 1 'done=$(wc -l output/index_structured_rest_p*_answers.jsonl 2>/dev/null | awk "/total/{print \$1}"); total=$(wc -l data/train_hard_rest_shards/part_*.jsonl | awk "/total/{print \$1}"); awk -v d="${done:-0}" -v t="$total" "BEGIN{printf \"generation: %d / %d (%.2f%%)\n\", d, t, d/t*100}"'
+
+merge answers
+python eval/merge_answer_shards.py \
+  --inputs \
+    output/index_structured_rest_p00_answers.jsonl \
+    output/index_structured_rest_p01_answers.jsonl \
+    output/index_structured_rest_p02_answers.jsonl \
+    output/index_structured_rest_p03_answers.jsonl \
+    output/index_structured_rest_p04_answers.jsonl \
+    output/index_structured_rest_p05_answers.jsonl \
+    output/index_structured_rest_p06_answers.jsonl \
+    output/index_structured_rest_p07_answers.jsonl \
+    output/index_50k_structured_answers_part_many.jsonl \
+  --output output/index_50k_structured_answers.jsonl \
+  --meta-output output/index_50k_structured_merge_meta.json
+
+score
+CUDA_VISIBLE_DEVICES=4 \
+PYTHONUNBUFFERED=1 \
+nohup python -u eval/run_rag_hard_eval.py \
+  --stage score \
+  --output-dir output/rag_structured \
+  --run-name index_50k_structured \
+  --bert-device cuda:0 \
+  > output/rag_structured/score_structured.log 2>&1 &
+
+scoring progress
+watch -n 120 'done=$(awk '\''/scored_examples=/{split($0,a,"scored_examples="); split(a[2],b," "); x=b[1]} END{print x+0}'\'' output/rag_structured/score_structured.log); total=$(wc -l < output/rag_structured/index_50k_structured_answers.jsonl); awk -v d="$done" -v t="$total" "BEGIN{printf \"scoring: %d / %d (%.2f%%)\n\", d, t, d/t*100}"'
